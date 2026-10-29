@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#0e221b"><meta name="description" content="RouteDrop: turn available time into booked jobs."><title>RouteDrop | Local service marketplace</title><link rel="stylesheet" href="/styles.css"><script src="/app.js" defer></script></head>
+<body>
+<div class="frame">
+<header class="topbar"><a class="brand" href="/">route<span>drop.</span></a><span class="version">PLATFORM BETA</span><div id="nav-account" class="navaccount"></div></header>
+<div id="status" class="status" role="status" aria-live="polite"></div>
+<nav class="tabs" aria-label="Navigation"><button type="button" data-tab="explore" class="active">Explore</button><button type="button" data-tab="bookings">My bookings</button><button type="button" data-tab="business">Business studio</button></nav>
+<main>
+<section id="explore" class="page">
+<div class="hero"><div class="eyebrow">BUILT FOR REAL LOCAL BUSINESSES</div><h1>More jobs.<br>Less downtime.<br><em>Better routes.</em></h1><p>Discover available openings from service crews already working nearby. Reserve through secure hosted checkout when enabled.</p></div>
+<div class="sectionhead"><h2>Available openings</h2><span id="offer-count" class="muted"></span></div><div class="filters"><input id="search" type="search" placeholder="Search services or neighborhoods" aria-label="Search listings"><select id="category" aria-label="Filter category"><option value="">All services</option><option>Washing</option><option>Lawn care</option><option>Car detailing</option><option>Cleaning</option><option>Other</option></select></div>
+<div id="offers" class="cards"></div>
+</section>
+<section id="bookings" class="page hidden"><div class="eyebrow">YOUR ACTIVITY</div><h1>My bookings.</h1><p class="muted">Confirmed payments appear only after Stripe verifies the charge.</p><div id="my-bookings"></div></section>
+<section id="business" class="page hidden"><div class="eyebrow">BUSINESS CONTROL CENTER</div><h1>Fill empty hours.</h1><div id="studio-body"></div></section>
+</main>
+<footer><strong>RouteDrop</strong><span>Early-access platform beta · No demo charges</span></footer>
+</div>
+<div id="modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="modal-title"><div class="modal-content"><button id="close-modal" class="close" aria-label="Close dialog">✕</button><div id="modal-body"></div></div></div>
+</body></html>
