@@ -1,0 +1,249 @@
+'use strict';
+const express = require('express');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
+const cookieParser = require('cookie-parser');
+const bcrypt = require('bcryptjs');
+const crypto = require('crypto');
+const { Pool } = require('pg');
+const Stripe = require('stripe');
+
+const app = express();
+app.disable('x-powered-by');
+app.set('trust proxy', 1);
+const port = Number(process.env.PORT || 10000);
+const baseUrl = (process.env.PUBLIC_URL || '').replace(/\/+$/, '');
+const databaseUrl = process.env.DATABASE_URL || '';
+const stripeKey = process.env.STRIPE_SECRET_KEY || '';
+const stripeWebhookSecret = process.env.STRIPE_WEBHOOK_SECRET || '';
+const stripe = stripeKey ? new Stripe(stripeKey) : null;
+const pool = databaseUrl ? new Pool({ connectionString: databaseUrl, max: 5, idleTimeoutMillis: 30000, connectionTimeoutMillis: 10000, ssl: databaseUrl.includes('localhost') ? false : { rejectUnauthorized: false } }) : null;
+const safe = fn => (req, res, next) => Promise.resolve(fn(req, res)).catch(next);
+const hash = value => crypto.createHash('sha256').update(value).digest('hex');
+const random = () => crypto.randomBytes(32).toString('hex');
+const forbidden = (res, msg, code=400) => res.status(code).json({ error: msg });
+const clean = (v, len=120) => typeof v === 'string' ? v.trim().slice(0, len) : '';
+const isEmail = v => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v) && v.length <= 254;
+const usd = value => Number.isSafeInteger(value) && value>=500 && value<=500000;
+let ready = false;
+
+app.use(helmet({
+ contentSecurityPolicy: { directives: { defaultSrc:["'self'"], scriptSrc:["'self'"], styleSrc:["'self'","'unsafe-inline'"], imgSrc:["'self'","data:"], connectSrc:["'self'"], objectSrc:["'none'"], frameAncestors:["'none'"], upgradeInsecureRequests: process.env.NODE_ENV==='production' ? [] : null } },
+ referrerPolicy: { policy:'no-referrer' }
+}));
+app.use(cookieParser());
+app.use((req,res,next) => {
+ if (req.path.startsWith('/api/')) res.set('Cache-Control', 'no-store');
+ next();
+});
+app.use('/api', rateLimit({ windowMs:15*60*1000, limit:200, standardHeaders:'draft-7', legacyHeaders:false }));
+const authLimiter = rateLimit({ windowMs:15*60*1000, limit:12, standardHeaders:'draft-7', legacyHeaders:false });
+const checkoutLimiter = rateLimit({windowMs:15*60*1000, limit:15, standardHeaders:'draft-7', legacyHeaders:false});
+
+const schema = String.raw; // no dynamic SQL interpolation in schema below
+const ddl = [
+ "CREATE TABLE IF NOT EXISTS users (id BIGSERIAL PRIMARY KEY, email TEXT UNIQUE NOT NULL, full_name TEXT NOT NULL, password_hash TEXT NOT NULL, role TEXT NOT NULL CHECK(role IN ('customer','business')), created_at TIMESTAMPTZ NOT NULL DEFAULT now())",
+ "CREATE TABLE IF NOT EXISTS businesses (id BIGSERIAL PRIMARY KEY, owner_id BIGINT UNIQUE NOT NULL REFERENCES users(id) ON DELETE CASCADE, name TEXT NOT NULL, city TEXT NOT NULL, category TEXT NOT NULL, stripe_account_id TEXT UNIQUE, created_at TIMESTAMPTZ NOT NULL DEFAULT now())",
+ "CREATE TABLE IF NOT EXISTS sessions (token_hash TEXT PRIMARY KEY, user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE, expires_at TIMESTAMPTZ NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now())",
+ "CREATE TABLE IF NOT EXISTS listings (id BIGSERIAL PRIMARY KEY, business_id BIGINT NOT NULL REFERENCES businesses(id) ON DELETE CASCADE, title TEXT NOT NULL, category TEXT NOT NULL, neighborhood TEXT NOT NULL, price_cents INTEGER NOT NULL CHECK(price_cents BETWEEN 500 AND 500000), slot_start TIMESTAMPTZ NOT NULL, duration_minutes INTEGER NOT NULL DEFAULT 60 CHECK(duration_minutes BETWEEN 30 AND 480), status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','paused')), created_at TIMESTAMPTZ NOT NULL DEFAULT now())",
+ "CREATE TABLE IF NOT EXISTS bookings (id BIGSERIAL PRIMARY KEY, listing_id BIGINT NOT NULL REFERENCES listings(id), customer_id BIGINT NOT NULL REFERENCES users(id), status TEXT NOT NULL DEFAULT 'awaiting_payment' CHECK(status IN ('awaiting_payment','paid','completed','canceled')), price_cents INTEGER NOT NULL, fee_cents INTEGER NOT NULL, checkout_session_id TEXT UNIQUE, payment_intent_id TEXT, hold_expires_at TIMESTAMPTZ, created_at TIMESTAMPTZ NOT NULL DEFAULT now())",
+ "CREATE UNIQUE INDEX IF NOT EXISTS one_active_booking_per_slot ON bookings(listing_id) WHERE status IN ('awaiting_payment','paid','completed')",
+ "CREATE INDEX IF NOT EXISTS listings_active_time ON listings(status, slot_start)",
+ "CREATE INDEX IF NOT EXISTS bookings_customer ON bookings(customer_id)",
+ "CREATE INDEX IF NOT EXISTS bookings_listing ON bookings(listing_id)",
+ "CREATE TABLE IF NOT EXISTS stripe_events (id TEXT PRIMARY KEY, received_at TIMESTAMPTZ NOT NULL DEFAULT now())"
+];
+async function startDatabase() {
+ if (!pool) return;
+ try {
+  for (const statement of ddl) await pool.query(statement);
+  ready = true;
+  console.log('RouteDrop PostgreSQL ready');
+ } catch(err) { ready=false; console.error('Database unavailable:',err.message); }
+}
+function requireDb(req,res,next) { if (!ready) return forbidden(res,'Accounts are not yet enabled. The private beta database is pending setup.',503); next(); }
+function setCookie(res,token) { res.cookie('__Host-rd_session',token,{secure:process.env.NODE_ENV==='production',httpOnly:true,sameSite:'lax',path:'/',maxAge:7*24*60*60*1000}); }
+async function sessionUser(req,res,next) {
+ try {
+  req.user=null;
+  const token=req.cookies['__Host-rd_session'];
+  if (token && ready && /^[a-f0-9]{64}$/.test(token)) {
+   const result=await pool.query("SELECT u.id,u.full_name,u.email,u.role FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=$1 AND s.expires_at>now()",[hash(token)]);
+   req.user=result.rows[0]||null;
+  }
+  next();
+ } catch(nextError){next(nextError);}
+}
+function requireUser(role) { return (req,res,next) => {
+ if (!req.user) return forbidden(res,'Please sign in.',401);
+ if (role && req.user.role!==role) return forbidden(res,'Account does not have permission.',403);
+ next();
+};}
+async function createSession(userId,res) {
+ const token=random();
+ await pool.query("INSERT INTO sessions(token_hash,user_id,expires_at) VALUES ($1,$2,now() + interval '7 days')",[hash(token),userId]);
+ setCookie(res,token);
+}
+function checkMutation(req,res,next) {
+ if (!['POST','PATCH','PUT','DELETE'].includes(req.method))return next();
+ if (req.path==='/api/stripe/webhook') return next();
+ const origin=req.get('origin');
+ const expected=baseUrl || ((req.protocol==='https'?'https://':'http://')+req.get('host'));
+ if (origin!==expected) return forbidden(res,'Invalid request origin.',403);
+ const csrf=req.cookies.routedrop_csrf;
+ if (!csrf || csrf!==req.get('x-csrf-token') || !/^[a-f0-9]{64}$/.test(csrf)) return forbidden(res,'Refresh the page and try again.',403);
+ next();
+}
+app.get('/health', (req,res)=>res.status(200).json({service:'RouteDrop platform beta',server:'up',database:ready?'ready':'not configured',payments:!!(stripe&&stripeWebhookSecret)?'configured':'not configured',mode:'beta'}));
+app.post('/api/stripe/webhook', express.raw({type:'application/json'}),safe(async(req,res)=>{
+ if (!stripe || !stripeWebhookSecret) return forbidden(res,'Payments not configured',503);
+ let event;
+ try { event=stripe.webhooks.constructEvent(req.body,req.get('stripe-signature'),stripeWebhookSecret); }
+ catch(e) {return forbidden(res,'Invalid webhook signature',400);}
+ if (!ready) return forbidden(res,'Database not ready',503);
+ const client=await pool.connect();
+ try{
+  await client.query('BEGIN');
+  const logged=await client.query('INSERT INTO stripe_events(id) VALUES($1) ON CONFLICT DO NOTHING RETURNING id',[event.id]);
+  if (!logged.rowCount){await client.query('COMMIT');return res.json({received:true});}
+  const session=event.data.object;
+  const bookingId=Number(session.metadata&&session.metadata.booking_id);
+  if (Number.isSafeInteger(bookingId)&&bookingId>0){
+   if ((event.type==='checkout.session.completed' && session.payment_status==='paid') || event.type==='checkout.session.async_payment_succeeded'){
+    await client.query("UPDATE bookings SET status='paid',payment_intent_id=$3 WHERE id=$1 AND checkout_session_id=$2 AND status='awaiting_payment'",[bookingId,session.id,typeof session.payment_intent==='string'?session.payment_intent:null]);
+   } else if (event.type==='checkout.session.expired'||event.type==='checkout.session.async_payment_failed'){
+    await client.query("UPDATE bookings SET status='canceled' WHERE id=$1 AND checkout_session_id=$2 AND status='awaiting_payment'",[bookingId,session.id]);
+   }
+  }
+  await client.query('COMMIT');
+  res.json({received:true});
+ }catch(err){await client.query('ROLLBACK');throw err;}finally{client.release();}
+}));
+app.use(express.json({limit:'16kb'}));
+app.use(checkMutation);
+app.use(sessionUser);
+app.get('/api/config',(req,res)=>{
+ if(!req.cookies.routedrop_csrf || !/^[a-f0-9]{64}$/.test(req.cookies.routedrop_csrf)){
+  res.cookie('routedrop_csrf',random(),{secure:process.env.NODE_ENV==='production',httpOnly:false,sameSite:'lax',path:'/',maxAge:7*24*60*60*1000});
+ }
+ res.json({database:ready,payments:!!(stripe&&stripeWebhookSecret),status:ready?'beta':'setup_required',public_url:baseUrl});
+});
+app.post('/api/register',requireDb,authLimiter,safe(async(req,res)=>{
+ const name=clean(req.body.name,90),email=clean(req.body.email,254).toLowerCase(),password=String(req.body.password||''),role=req.body.role;
+ const businessName=clean(req.body.businessName,120),city=clean(req.body.city,100),category=clean(req.body.category,40);
+ if(!name||!isEmail(email)||password.length<12||password.length>128||!['customer','business'].includes(role))return forbidden(res,'Provide name, email, role, and a password of 12–128 characters.');
+ if(role==='business' && (!businessName||!city||!category))return forbidden(res,'Complete the business details.');
+ const pw=await bcrypt.hash(password,12);
+ const client=await pool.connect();
+ try {
+  await client.query('BEGIN');
+  const u=await client.query('INSERT INTO users(email,full_name,password_hash,role) VALUES($1,$2,$3,$4) RETURNING id',[email,name,pw,role]);
+  if(role==='business')await client.query('INSERT INTO businesses(owner_id,name,city,category) VALUES($1,$2,$3,$4)',[u.rows[0].id,businessName,city,category]);
+  await client.query('COMMIT');
+  await createSession(u.rows[0].id,res);
+  res.status(201).json({ok:true});
+ }catch(e){await client.query('ROLLBACK').catch(()=>{});if(e.code==='23505')return forbidden(res,'Email is already registered.',409);throw e;}finally{client.release();}
+}));
+app.post('/api/login',requireDb,authLimiter,safe(async(req,res)=>{
+ const email=clean(req.body.email,254).toLowerCase(),password=String(req.body.password||'');
+ const found=await pool.query('SELECT id,password_hash FROM users WHERE email=$1',[email]);
+ const hashToCheck=found.rows[0]?.password_hash || '$2a$12$ydzYsIdIjOoOP1fi1gbF7Os10QXaYjK.hOSvG.Civaj6pcCHXy1ti';
+ const match=await bcrypt.compare(password,hashToCheck);
+ if(!match||!found.rows[0])return forbidden(res,'Email or password is incorrect.',401);
+ await createSession(found.rows[0].id,res);
+ res.json({ok:true});
+}));
+app.post('/api/logout',requireDb,requireUser(),safe(async(req,res)=>{
+ const token=req.cookies['__Host-rd_session'];
+ if(token)await pool.query('DELETE FROM sessions WHERE token_hash=$1',[hash(token)]);
+ res.clearCookie('__Host-rd_session',{path:'/'});
+ res.json({ok:true});
+}));
+app.get('/api/me',requireDb,safe(async(req,res)=>{
+ if(!req.user)return res.json({user:null});
+ let business=null;
+ if(req.user.role==='business'){
+  const r=await pool.query('SELECT id,name,city,category, (stripe_account_id IS NOT NULL) AS stripe_connected FROM businesses WHERE owner_id=$1',[req.user.id]);
+  business=r.rows[0]||null;
+ }
+ res.json({user:req.user,business});
+}));
+app.get('/api/listings',requireDb,safe(async(req,res)=>{
+ const data=await pool.query("SELECT l.id,l.title,l.category,l.neighborhood,l.price_cents,l.slot_start,l.duration_minutes,b.name AS business_name,b.city FROM listings l JOIN businesses b ON b.id=l.business_id WHERE l.status='active' AND l.slot_start>now() AND NOT EXISTS(SELECT 1 FROM bookings k WHERE k.listing_id=l.id AND k.status IN ('awaiting_payment','paid','completed')) ORDER BY l.slot_start ASC LIMIT 100");
+ res.json({listings:data.rows});
+}));
+app.post('/api/listings',requireDb,requireUser('business'),safe(async(req,res)=>{
+ const title=clean(req.body.title,120),category=clean(req.body.category,50),neighborhood=clean(req.body.neighborhood,100),price=Number(req.body.priceCents),start=new Date(req.body.slotStart),mins=Number(req.body.durationMinutes||60);
+ if(!title||!category||!neighborhood||!usd(price)||isNaN(start.getTime())||start.getTime()<Date.now()+10*60*1000||start.getTime()>Date.now()+60*24*60*60*1000||!Number.isInteger(mins)||mins<30||mins>480)return forbidden(res,'Check all service fields. Minimum price is $5 and opening must be within 60 days.');
+ const r=await pool.query('INSERT INTO listings(business_id,title,category,neighborhood,price_cents,slot_start,duration_minutes) SELECT id,$2,$3,$4,$5,$6,$7 FROM businesses WHERE owner_id=$1 RETURNING id',[req.user.id,title,category,neighborhood,price,start.toISOString(),mins]);
+ if(!r.rowCount)return forbidden(res,'Register a business first.',403);
+ res.status(201).json({listing:r.rows[0]});
+}));
+app.get('/api/bookings',requireDb,requireUser(),safe(async(req,res)=>{
+ const clause=req.user.role==='customer'?'k.customer_id=$1':'b.owner_id=$1';
+ const r=await pool.query("SELECT k.id,k.status,k.price_cents,k.fee_cents,k.created_at,l.title,l.slot_start,l.neighborhood,b.name AS business_name FROM bookings k JOIN listings l ON l.id=k.listing_id JOIN businesses b ON b.id=l.business_id WHERE "+clause+" ORDER BY k.created_at DESC LIMIT 100",[req.user.id]);
+ res.json({bookings:r.rows});
+}));
+app.get('/api/my-listings',requireDb,requireUser('business'),safe(async(req,res)=>{
+ const r=await pool.query('SELECT l.id,l.title,l.price_cents,l.neighborhood,l.slot_start,l.status FROM listings l JOIN businesses b ON b.id=l.business_id WHERE b.owner_id=$1 ORDER BY l.created_at DESC LIMIT 100',[req.user.id]);
+ res.json({listings:r.rows});
+}));
+app.post('/api/stripe/connect',requireDb,requireUser('business'),safe(async(req,res)=>{
+ if(!stripe||!baseUrl) return forbidden(res,'Stripe Connect is awaiting platform setup.',503);
+ const r=await pool.query('SELECT id,stripe_account_id FROM businesses WHERE owner_id=$1',[req.user.id]);
+ if(!r.rowCount)return forbidden(res,'Business not found.',404);
+ let accountId=r.rows[0].stripe_account_id;
+ if(!accountId){
+  const account=await stripe.accounts.create({type:'express',country:'US',capabilities:{card_payments:{requested:true},transfers:{requested:true}},metadata:{routedrop_business_id:String(r.rows[0].id)}});
+  accountId=account.id;
+  await pool.query('UPDATE businesses SET stripe_account_id=$1 WHERE id=$2 AND stripe_account_id IS NULL',[accountId,r.rows[0].id]);
+ }
+ const url=await stripe.accountLinks.create({account:accountId,refresh_url:baseUrl+'/?stripe=retry',return_url:baseUrl+'/?stripe=return',type:'account_onboarding'});
+ res.json({url:url.url});
+}));
+app.post('/api/checkout',requireDb,requireUser('customer'),checkoutLimiter,safe(async(req,res)=>{
+ if(!stripe||!stripeWebhookSecret||!baseUrl)return forbidden(res,'Checkout is disabled until Stripe is fully configured.',503);
+ const id=Number(req.body.listingId);
+ if(!Number.isSafeInteger(id)||id<1)return forbidden(res,'Invalid listing.');
+ const client=await pool.connect();
+ let booking,offer;
+ try{
+  await client.query('BEGIN');
+  offer=(await client.query("SELECT l.id,l.title,l.price_cents,l.slot_start,b.stripe_account_id FROM listings l JOIN businesses b ON b.id=l.business_id WHERE l.id=$1 AND l.status='active' AND l.slot_start>now() FOR UPDATE OF l",[id])).rows[0];
+  if(!offer){await client.query('ROLLBACK');return forbidden(res,'Route is not available.',404);}
+  await client.query("UPDATE bookings SET status='canceled' WHERE listing_id=$1 AND status='awaiting_payment' AND hold_expires_at<now()",[id]);
+  const fee=Math.max(1,Math.round(offer.price_cents*.08));
+  const result=await client.query("INSERT INTO bookings(listing_id,customer_id,status,price_cents,fee_cents,hold_expires_at) VALUES($1,$2,'awaiting_payment',$3,$4,now()+interval '45 minutes') RETURNING id",[id,req.user.id,offer.price_cents,fee]);
+  booking=result.rows[0];
+  await client.query('COMMIT');
+ } catch(e){await client.query('ROLLBACK').catch(()=>{});if(e.code==='23505')return forbidden(res,'This slot is reserved already.',409);throw e;} finally{client.release();}
+ try{
+  if(!offer.stripe_account_id)throw Error('This business has not connected payments.');
+  const account=await stripe.accounts.retrieve(offer.stripe_account_id);
+  if(!account.charges_enabled||!account.payouts_enabled)throw Error('This business has not completed payout onboarding.');
+  const checkout=await stripe.checkout.sessions.create({
+   mode:'payment',payment_method_types:['card'],customer_email:req.user.email,
+   line_items:[{price_data:{currency:'usd',unit_amount:offer.price_cents,product_data:{name:offer.title}},quantity:1}],
+   payment_intent_data:{application_fee_amount:Math.round(offer.price_cents*.08),transfer_data:{destination:offer.stripe_account_id}},
+   client_reference_id:String(booking.id),metadata:{booking_id:String(booking.id),listing_id:String(offer.id)},
+   success_url:baseUrl+'/?payment=return',cancel_url:baseUrl+'/?payment=cancel',
+   expires_at:Math.floor(Date.now()/1000)+30*60
+  },{idempotencyKey:'routedrop-checkout-'+booking.id});
+  await pool.query('UPDATE bookings SET checkout_session_id=$1 WHERE id=$2',[checkout.id,booking.id]);
+  res.json({url:checkout.url});
+ }catch(e){
+  await pool.query("UPDATE bookings SET status='canceled' WHERE id=$1 AND status='awaiting_payment'",[booking.id]).catch(()=>{});
+  return forbidden(res,e.message.startsWith('This business')?e.message:'Checkout could not start. Please try again.',409);
+ }
+}));
+app.post('/api/bookings/:id/complete',requireDb,requireUser('business'),safe(async(req,res)=>{
+ const id=Number(req.params.id);
+ if(!Number.isSafeInteger(id))return forbidden(res,'Invalid booking');
+ const r=await pool.query("UPDATE bookings k SET status='completed' FROM listings l JOIN businesses b ON b.id=l.business_id WHERE k.listing_id=l.id AND b.owner_id=$1 AND k.id=$2 AND k.status='paid' RETURNING k.id",[req.user.id,id]);
+ if(!r.rowCount)return forbidden(res,'No eligible paid booking found.',409);
+ res.json({ok:true});
+}));
+app.use(express.static('routedrop-platform/public',{fallthrough:false,maxAge:'15m'}));
+app.use((err,req,res,next)=>{console.error('RouteDrop request error',err.message);res.status(500).json({error:'Unexpected server error.'});});
+app.listen(port,'0.0.0.0',()=>console.log('RouteDrop beta listening on '+port));
+startDatabase();
