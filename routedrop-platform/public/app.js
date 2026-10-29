@@ -2,7 +2,7 @@
 (function(){
 const $=id=>document.getElementById(id);
 const state={config:null,me:null,listings:[],bookings:[],mine:[],tab:'explore'};
-const esc=v=>String(v===null||v===undefined?'':v).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;':'&quot;',"'":'&#39;'}[c]));
+const esc=v=>String(v===null||v===undefined?'':v).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const money=cents=>new Intl.NumberFormat('en-US',{style:'currency',currency:'USD'}).format(Number(cents||0)/100);
 const when=iso=>new Intl.DateTimeFormat('en-US',{month:'short',day:'numeric',hour:'numeric',minute:'2-digit'}).format(new Date(iso));
 function csrf(){const cookie=document.cookie.split('; ').find(s=>s.startsWith('routedrop_csrf='));return cookie?decodeURIComponent(cookie.slice(15)):'';}
