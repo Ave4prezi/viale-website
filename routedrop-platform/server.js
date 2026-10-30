@@ -51,7 +51,8 @@ const ddl = [
  "CREATE INDEX IF NOT EXISTS listings_active_time ON listings(status, slot_start)",
  "CREATE INDEX IF NOT EXISTS bookings_customer ON bookings(customer_id)",
  "CREATE INDEX IF NOT EXISTS bookings_listing ON bookings(listing_id)",
- "CREATE TABLE IF NOT EXISTS stripe_events (id TEXT PRIMARY KEY, received_at TIMESTAMPTZ NOT NULL DEFAULT now())"
+ "CREATE TABLE IF NOT EXISTS stripe_events (id TEXT PRIMARY KEY, received_at TIMESTAMPTZ NOT NULL DEFAULT now())",
+ "ALTER TABLE businesses ADD COLUMN IF NOT EXISTS subscription_customer_id TEXT UNIQUE"
 ];
 async function startDatabase() {
  if (!pool) return;
