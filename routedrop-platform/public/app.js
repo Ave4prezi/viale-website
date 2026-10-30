@@ -62,6 +62,7 @@ async function studio(){
  if(u.role!=='business'){$('studio-body').innerHTML='<div class="empty">You are signed in as a customer. Use a separate business account to publish routes.</div>';return;}
  const b=state.me.business,r=await Promise.all([api('/api/my-listings'),api('/api/bookings')]);
  state.mine=r[0].listings;state.bookings=r[1].bookings;
+ const subscription=await api('/api/business/subscription');
  const completed=state.bookings.filter(x=>x.status==='completed');
  const gross=completed.reduce((sum,x)=>sum+x.price_cents,0),fee=completed.reduce((sum,x)=>sum+x.fee_cents,0);
  $('studio-body').innerHTML=
@@ -88,6 +89,7 @@ async function act(e){
  if(action==='login'){showLogin();return;}
  if(action==='create-listing'){showListing();return;}
  if(action==='logout'){try{await api('/api/logout',{method:'POST'});state.me=null;message('Signed out.');refresh();}catch(err){message(err.message,true);}return;}
+ if(action==='subscribe'||action==='manage-subscription'){try{const url=action==='subscribe'?'/api/business/subscribe':'/api/business/subscription/portal';const r=await api(url,{method:'POST'});location.assign(r.url);}catch(err){message(err.message,true);}return;}
  if(action==='connect-stripe'){try{const r=await api('/api/stripe/connect',{method:'POST'});location.assign(r.url);}catch(err){message(err.message,true);}return;}
  if(el.dataset.book){
   if(!state.me?.user){showLogin();message('Please log in to book a service.');return;}
@@ -130,6 +132,7 @@ async function init(){
   state.config=await api('/api/config');
   if(!state.config.database)message('Private beta: an isolated database must be connected before registration and bookings can work.');
   else if(!state.config.payments)message('Accounts and listings enabled. Stripe payments and payouts are not yet configured.');
+  if(new URLSearchParams(location.search).has('subscription'))message('Returned from subscription billing. Open Business Studio to check your subscription status.');
   if(new URLSearchParams(location.search).has('payment'))message('Returned from checkout. Payment status is confirmed only through the Stripe webhook; check My bookings.');
   if(new URLSearchParams(location.search).has('stripe'))message('Returned from Stripe onboarding. Payout readiness is checked when a checkout begins.');
   await refresh();
