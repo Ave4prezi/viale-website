@@ -189,6 +189,22 @@ app.get('/api/my-listings',requireDb,requireUser('business'),safe(async(req,res)
  const r=await pool.query('SELECT l.id,l.title,l.price_cents,l.neighborhood,l.slot_start,l.status FROM listings l JOIN businesses b ON b.id=l.business_id WHERE b.owner_id=$1 ORDER BY l.created_at DESC LIMIT 100',[req.user.id]);
  res.json({listings:r.rows});
 }));
+app.get('/api/business/subscription',requireDb,requireUser('business'),safe(async(req,res)=>{
+ if(!stripe)return forbidden(res,'Stripe unavailable.',503);
+ const r=await pool.query('SELECT subscription_customer_id FROM businesses WHERE owner_id=$1',[req.user.id]);
+ const customer=r.rows[0]?.subscription_customer_id;
+ if(!customer)return res.json({status:'none'});
+ const subs=await stripe.subscriptions.list({customer,limit:20});
+ const sub=subs.data.find(x=>['active','trialing','past_due','unpaid','incomplete'].includes(x.status))||subs.data[0];
+ res.json({status:sub?.status||'none',cancel_at_period_end:!!sub?.cancel_at_period_end});
+}));
+app.post('/api/business/subscription/portal',requireDb,requireUser('business'),checkoutLimiter,safe(async(req,res)=>{
+ if(!stripe||!baseUrl)return forbidden(res,'Stripe unavailable.',503);
+ const r=await pool.query('SELECT subscription_customer_id FROM businesses WHERE owner_id=$1',[req.user.id]);
+ if(!r.rows[0]?.subscription_customer_id)return forbidden(res,'No billing account found.',404);
+ const p=await stripe.billingPortal.sessions.create({customer:r.rows[0].subscription_customer_id,return_url:baseUrl+'/?subscription=return'});
+ res.json({url:p.url});
+}));
 app.post('/api/business/subscribe',requireDb,requireUser('business'),checkoutLimiter,safe(async(req,res)=>{
  if(!stripe||!baseUrl)return forbidden(res,'Stripe unavailable.',503);
  const r=await pool.query('SELECT id,subscription_customer_id FROM businesses WHERE owner_id=$1',[req.user.id]);
