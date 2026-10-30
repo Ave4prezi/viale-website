@@ -17,6 +17,9 @@ const databaseUrl = process.env.DATABASE_URL || '';
 const stripeKey = process.env.STRIPE_SECRET_KEY || '';
 const stripeWebhookSecret = process.env.STRIPE_WEBHOOK_SECRET || '';
 const stripe = stripeKey ? new Stripe(stripeKey) : null;
+const liveKey = /^(sk|rk)_live_/.test(stripeKey);
+const paymentsApproved = !liveKey || process.env.ROUTEDROP_LIVE_APPROVED === 'true';
+const paymentsReady = !!(stripe && stripeWebhookSecret && paymentsApproved);
 const pool = databaseUrl ? new Pool({ connectionString: databaseUrl, max: 5, idleTimeoutMillis: 30000, connectionTimeoutMillis: 10000, ssl: databaseUrl.includes('localhost') ? false : { rejectUnauthorized: false } }) : null;
 const safe = fn => (req, res, next) => Promise.resolve(fn(req, res)).catch(next);
 const hash = value => crypto.createHash('sha256').update(value).digest('hex');
@@ -95,9 +98,9 @@ function checkMutation(req,res,next) {
  if (!csrf || csrf!==req.get('x-csrf-token') || !/^[a-f0-9]{64}$/.test(csrf)) return forbidden(res,'Refresh the page and try again.',403);
  next();
 }
-app.get('/health', (req,res)=>res.status(200).json({service:'RouteDrop platform beta',server:'up',database:ready?'ready':'not configured',payments:!!(stripe&&stripeWebhookSecret)?'configured':'not configured',mode:'beta'}));
+app.get('/health', (req,res)=>res.status(200).json({service:'RouteDrop platform beta',server:'up',database:ready?'ready':'not configured',payments:paymentsReady?'configured':'not configured',mode:liveKey?(paymentsApproved?'live':'live_locked'):'beta'}));
 app.post('/api/stripe/webhook', express.raw({type:'application/json'}),safe(async(req,res)=>{
- if (!stripe || !stripeWebhookSecret) return forbidden(res,'Payments not configured',503);
+ if (!paymentsReady) return forbidden(res,'Payments not configured',503);
  let event;
  try { event=stripe.webhooks.constructEvent(req.body,req.get('stripe-signature'),stripeWebhookSecret); }
  catch(e) {return forbidden(res,'Invalid webhook signature',400);}
@@ -127,7 +130,7 @@ app.get('/api/config',(req,res)=>{
  if(!req.cookies.routedrop_csrf || !/^[a-f0-9]{64}$/.test(req.cookies.routedrop_csrf)){
   res.cookie('routedrop_csrf',random(),{secure:process.env.NODE_ENV==='production',httpOnly:false,sameSite:'lax',path:'/',maxAge:7*24*60*60*1000});
  }
- res.json({database:ready,payments:!!(stripe&&stripeWebhookSecret),status:ready?'beta':'setup_required',public_url:baseUrl});
+ res.json({database:ready,payments:paymentsReady,status:ready?'beta':'setup_required',payments_mode:liveKey?(paymentsApproved?'live':'live_locked'):'test',public_url:baseUrl});
 });
 app.post('/api/register',requireDb,authLimiter,safe(async(req,res)=>{
  const name=clean(req.body.name,90),email=clean(req.body.email,254).toLowerCase(),password=String(req.body.password||''),role=req.body.role;
@@ -190,7 +193,7 @@ app.get('/api/my-listings',requireDb,requireUser('business'),safe(async(req,res)
  res.json({listings:r.rows});
 }));
 app.get('/api/business/subscription',requireDb,requireUser('business'),safe(async(req,res)=>{
- if(!stripe)return forbidden(res,'Stripe unavailable.',503);
+ if(!paymentsReady)return forbidden(res,'Stripe unavailable.',503);
  const r=await pool.query('SELECT subscription_customer_id FROM businesses WHERE owner_id=$1',[req.user.id]);
  const customer=r.rows[0]?.subscription_customer_id;
  if(!customer)return res.json({status:'none'});
@@ -199,14 +202,14 @@ app.get('/api/business/subscription',requireDb,requireUser('business'),safe(asyn
  res.json({status:sub?.status||'none',cancel_at_period_end:!!sub?.cancel_at_period_end});
 }));
 app.post('/api/business/subscription/portal',requireDb,requireUser('business'),checkoutLimiter,safe(async(req,res)=>{
- if(!stripe||!baseUrl)return forbidden(res,'Stripe unavailable.',503);
+ if(!paymentsReady||!baseUrl)return forbidden(res,'Stripe unavailable.',503);
  const r=await pool.query('SELECT subscription_customer_id FROM businesses WHERE owner_id=$1',[req.user.id]);
  if(!r.rows[0]?.subscription_customer_id)return forbidden(res,'No billing account found.',404);
  const p=await stripe.billingPortal.sessions.create({customer:r.rows[0].subscription_customer_id,return_url:baseUrl+'/?subscription=return'});
  res.json({url:p.url});
 }));
 app.post('/api/business/subscribe',requireDb,requireUser('business'),checkoutLimiter,safe(async(req,res)=>{
- if(!stripe||!baseUrl)return forbidden(res,'Stripe unavailable.',503);
+ if(!paymentsReady||!baseUrl)return forbidden(res,'Stripe unavailable.',503);
  const r=await pool.query('SELECT id,subscription_customer_id FROM businesses WHERE owner_id=$1',[req.user.id]);
  const b=r.rows[0];if(!b)return forbidden(res,'Business not found.',404);
  let customer=b.subscription_customer_id;
@@ -223,7 +226,7 @@ app.post('/api/business/subscribe',requireDb,requireUser('business'),checkoutLim
  res.json({url:session.url});
 }));
 app.post('/api/stripe/connect',requireDb,requireUser('business'),safe(async(req,res)=>{
- if(!stripe||!baseUrl) return forbidden(res,'Stripe Connect is awaiting platform setup.',503);
+ if(!paymentsReady||!baseUrl) return forbidden(res,'Stripe Connect is awaiting platform setup.',503);
  const r=await pool.query('SELECT id,stripe_account_id FROM businesses WHERE owner_id=$1',[req.user.id]);
  if(!r.rowCount)return forbidden(res,'Business not found.',404);
  let accountId=r.rows[0].stripe_account_id;
@@ -236,7 +239,7 @@ app.post('/api/stripe/connect',requireDb,requireUser('business'),safe(async(req,
  res.json({url:url.url});
 }));
 app.post('/api/checkout',requireDb,requireUser('customer'),checkoutLimiter,safe(async(req,res)=>{
- if(!stripe||!stripeWebhookSecret||!baseUrl)return forbidden(res,'Checkout is disabled until Stripe is fully configured.',503);
+ if(!paymentsReady||!baseUrl)return forbidden(res,'Checkout is disabled until Stripe is fully configured.',503);
  const id=Number(req.body.listingId);
  if(!Number.isSafeInteger(id)||id<1)return forbidden(res,'Invalid listing.');
  const client=await pool.connect();
@@ -271,7 +274,7 @@ app.post('/api/checkout',requireDb,requireUser('customer'),checkoutLimiter,safe(
  }
 }));
 app.post('/api/bookings/:id/retry-payment',requireDb,requireUser('customer'),checkoutLimiter,safe(async(req,res)=>{
- if(!stripe||!stripeWebhookSecret)return forbidden(res,'Payments not configured.',503);
+ if(!paymentsReady)return forbidden(res,'Payments not configured.',503);
  const id=Number(req.params.id);
  if(!Number.isSafeInteger(id)||id<1)return forbidden(res,'Invalid booking.');
  const client=await pool.connect();
