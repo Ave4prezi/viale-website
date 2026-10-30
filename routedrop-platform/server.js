@@ -236,6 +236,39 @@ app.post('/api/checkout',requireDb,requireUser('customer'),checkoutLimiter,safe(
   return forbidden(res,e.message.startsWith('This business')?e.message:'Checkout could not start. Please try again.',409);
  }
 }));
+app.post('/api/bookings/:id/retry-payment',requireDb,requireUser('customer'),checkoutLimiter,safe(async(req,res)=>{
+ if(!stripe||!stripeWebhookSecret)return forbidden(res,'Payments not configured.',503);
+ const id=Number(req.params.id);
+ if(!Number.isSafeInteger(id)||id<1)return forbidden(res,'Invalid booking.');
+ const client=await pool.connect();
+ try{
+  await client.query('BEGIN');
+  const q=await client.query("SELECT k.*,l.title,l.slot_start,b.stripe_account_id FROM bookings k JOIN listings l ON l.id=k.listing_id JOIN businesses b ON b.id=l.business_id WHERE k.id=$1 AND k.customer_id=$2 FOR UPDATE OF k",[id,req.user.id]);
+  const b=q.rows[0];
+  if(!b||b.status!=='awaiting_payment'){await client.query('ROLLBACK');return forbidden(res,'No unpaid booking found.',404);}
+  if(new Date(b.slot_start)<=new Date() || new Date(b.hold_expires_at)<=new Date()){
+   await client.query("UPDATE bookings SET status='canceled' WHERE id=$1",[id]);
+   await client.query('COMMIT');return forbidden(res,'Booking hold expired. Choose another opening.',409);
+  }
+  if(b.checkout_session_id){
+   const old=await stripe.checkout.sessions.retrieve(b.checkout_session_id);
+   if(old.payment_status==='paid'){await client.query('COMMIT');return forbidden(res,'Payment already received. Refresh bookings.',409);}
+   if(old.status==='open'&&old.url&&old.expires_at*1000>Date.now()+15000){await client.query('COMMIT');return res.json({url:old.url});}
+  }
+  const account=await stripe.accounts.retrieve(b.stripe_account_id);
+  if(!account.charges_enabled||!account.payouts_enabled){await client.query('ROLLBACK');return forbidden(res,'Business payouts unavailable.',409);}
+  const checkout=await stripe.checkout.sessions.create({
+   mode:'payment',payment_method_types:['card'],customer_email:req.user.email,
+   line_items:[{price_data:{currency:'usd',unit_amount:b.price_cents,product_data:{name:b.title}},quantity:1}],
+   payment_intent_data:{application_fee_amount:b.fee_cents,transfer_data:{destination:b.stripe_account_id}},
+   client_reference_id:String(id),metadata:{booking_id:String(id)},
+   success_url:baseUrl+'/?payment=return',cancel_url:baseUrl+'/?payment=cancel',
+   expires_at:Math.floor(Date.now()/1000)+1800
+  });
+  await client.query("UPDATE bookings SET checkout_session_id=$1,hold_expires_at=now()+interval '45 minutes' WHERE id=$2",[checkout.id,id]);
+  await client.query('COMMIT');res.json({url:checkout.url});
+ }catch(e){await client.query('ROLLBACK').catch(()=>{});throw e;}finally{client.release();}
+}));
 app.post('/api/bookings/:id/complete',requireDb,requireUser('business'),safe(async(req,res)=>{
  const id=Number(req.params.id);
  if(!Number.isSafeInteger(id))return forbidden(res,'Invalid booking');
