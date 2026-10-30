@@ -54,7 +54,7 @@ function renderOffers(){
 function renderBookings(){
  const list=state.bookings||[];
  $('my-bookings').innerHTML=list.length?list.map(b=>
-  '<div class="panel"><div class="row"><div><h3>'+esc(b.title)+'</h3><div class="muted">'+esc(b.business_name)+' · '+when(b.slot_start)+'</div></div><span class="pill">'+esc(b.status.replace('_',' '))+'</span></div><div class="record"><span>Service price</span><strong>'+money(b.price_cents)+'</strong></div>'+(state.me.user.role==='business'&&b.status==='paid'?'<button class="btn" data-complete="'+b.id+'">Mark job complete</button>':'')+'</div>').join(''):'<div class="empty"><h3>No bookings yet</h3><p>Bookings will appear here after a customer checks out.</p></div>';
+  '<div class="panel"><div class="row"><div><h3>'+esc(b.title)+'</h3><div class="muted">'+esc(b.business_name)+' · '+when(b.slot_start)+'</div></div><span class="pill">'+esc(b.status.replace('_',' '))+'</span></div><div class="record"><span>Service price</span><strong>'+money(b.price_cents)+'</strong></div>'+(state.me.user.role==='customer'&&b.status==='awaiting_payment'?'<button class="btn" data-retry="'+b.id+'">Retry payment</button>':'')+(state.me.user.role==='business'&&b.status==='paid'?'<button class="btn" data-complete="'+b.id+'">Mark job complete</button>':'')+'</div>').join(''):'<div class="empty"><h3>No bookings yet</h3><p>Bookings will appear here after a customer checks out.</p></div>';
 }
 async function studio(){
  const u=state.me?.user;
@@ -97,6 +97,7 @@ async function act(e){
   try{const result=await api('/api/checkout',{method:'POST',body:JSON.stringify({listingId:Number(el.dataset.book)})});location.assign(result.url);}catch(err){message(err.message,true);el.disabled=false;}
   return;
  }
+ if(el.dataset.retry){el.disabled=true;try{const r=await api('/api/bookings/'+Number(el.dataset.retry)+'/retry-payment',{method:'POST'});location.assign(r.url);}catch(err){message(err.message,true);el.disabled=false;}return;}
  if(el.dataset.complete){try{await api('/api/bookings/'+Number(el.dataset.complete)+'/complete',{method:'POST'});message('Job marked completed.');refresh();}catch(err){message(err.message,true);}return;}
 }
 async function submit(e){
