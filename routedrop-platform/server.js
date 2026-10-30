@@ -189,6 +189,23 @@ app.get('/api/my-listings',requireDb,requireUser('business'),safe(async(req,res)
  const r=await pool.query('SELECT l.id,l.title,l.price_cents,l.neighborhood,l.slot_start,l.status FROM listings l JOIN businesses b ON b.id=l.business_id WHERE b.owner_id=$1 ORDER BY l.created_at DESC LIMIT 100',[req.user.id]);
  res.json({listings:r.rows});
 }));
+app.post('/api/business/subscribe',requireDb,requireUser('business'),checkoutLimiter,safe(async(req,res)=>{
+ if(!stripe||!baseUrl)return forbidden(res,'Stripe unavailable.',503);
+ const r=await pool.query('SELECT id,subscription_customer_id FROM businesses WHERE owner_id=$1',[req.user.id]);
+ const b=r.rows[0];if(!b)return forbidden(res,'Business not found.',404);
+ let customer=b.subscription_customer_id;
+ if(!customer){
+  const c=await stripe.customers.create({email:req.user.email,metadata:{business_id:String(b.id)}},{idempotencyKey:'routedrop-sub-customer-'+b.id});
+  await pool.query('UPDATE businesses SET subscription_customer_id=$1 WHERE id=$2 AND subscription_customer_id IS NULL',[c.id,b.id]);
+  customer=(await pool.query('SELECT subscription_customer_id FROM businesses WHERE id=$1',[b.id])).rows[0].subscription_customer_id;
+ }
+ const subs=await stripe.subscriptions.list({customer,limit:20});
+ if(subs.data.some(x=>['active','trialing','past_due','unpaid','incomplete'].includes(x.status)))return forbidden(res,'Subscription already exists.',409);
+ const session=await stripe.checkout.sessions.create({mode:'subscription',customer,
+  line_items:[{price_data:{currency:'usd',unit_amount:7900,recurring:{interval:'month'},product_data:{name:'RouteDrop Business Membership'}},quantity:1}],
+  success_url:baseUrl+'/?subscription=return',cancel_url:baseUrl+'/?subscription=cancel'});
+ res.json({url:session.url});
+}));
 app.post('/api/stripe/connect',requireDb,requireUser('business'),safe(async(req,res)=>{
  if(!stripe||!baseUrl) return forbidden(res,'Stripe Connect is awaiting platform setup.',503);
  const r=await pool.query('SELECT id,stripe_account_id FROM businesses WHERE owner_id=$1',[req.user.id]);
